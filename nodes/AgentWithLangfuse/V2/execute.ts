@@ -41,10 +41,15 @@ import {
 import { SYSTEM_MESSAGE } from '../src/utils/prompt';
 
 /**
- * Converts a JSON Schema to a loose Zod schema.
- * It maps JSON Schema "properties" into Zod object fields,
- * but defaults to z.any() if type is unknown.
+ * Merges tools from connected Tool nodes with built-in tools from the model's metadata.
+ * Some chat model nodes (like OpenAI Chat Model) can define built-in tools (web_search, 
+ * file_search, code_interpreter) in their metadata when using Responses API.
  */
+function getAllTools(model: BaseChatModel, tools: Array<DynamicStructuredTool | Tool>) {
+    const modelTools = (model.metadata?.tools as Tool[]) ?? [];
+    const allTools = [...tools, ...modelTools];
+    return allTools;
+}
 
 /**
  * Creates an agent executor with the given configuration
@@ -60,19 +65,21 @@ function createAgentExecutor(
     langfuseHandler?: CallbackHandler
 ) {
     const callbacks = langfuseHandler ? [langfuseHandler] : [];
+    const allTools = getAllTools(model, tools);
 
     const agent = createToolCallingAgent({
         llm: model,
-        tools,
+        tools: allTools,
         prompt,
         streamRunnable: false,
     });
 
     let fallbackAgent: AgentRunnableSequence | undefined;
     if (fallbackModel) {
+        const allFallbackTools = getAllTools(fallbackModel, tools);
         fallbackAgent = createToolCallingAgent({
             llm: fallbackModel,
-            tools,
+            tools: allFallbackTools,
             prompt,
             streamRunnable: false,
         });
@@ -89,7 +96,7 @@ function createAgentExecutor(
     return AgentExecutor.fromAgentAndTools({
         agent: runnableAgent,
         memory,
-        tools,
+        tools: allTools,
         returnIntermediateSteps: options.returnIntermediateSteps === true,
         maxIterations: options.maxIterations ?? 10,
         callbacks,

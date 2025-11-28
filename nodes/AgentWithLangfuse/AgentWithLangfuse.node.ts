@@ -3,12 +3,13 @@ import type {
 	INodeExecutionData,
 	INodeType,
 	INodeTypeDescription,
+	EngineResponse,
+	EngineRequest,
 } from 'n8n-workflow';
 
 import { promptTypeOptions, textFromPreviousNode, textInput } from './src/utils/descriptions';
-// import { getInputs } from './utils';
-import { getToolsAgentProperties } from './V2/description';
-import { toolsAgentExecute } from './V2/execute';
+import { toolsAgentProperties } from './V3/description';
+import { toolsAgentExecute, type RequestResponseMetadata } from './V3/execute';
 import { getInputs } from './V2/utils';
 
 export class AgentWithLangfuse implements INodeType {
@@ -21,7 +22,7 @@ export class AgentWithLangfuse implements INodeType {
 		defaults: {
 			name: 'AI Agent with Langfuse',
 		},
-		version: 2,
+		version: 3,
 		codex: {
 			categories: ['AI'],
 			subcategories: {
@@ -164,7 +165,7 @@ export class AgentWithLangfuse implements INodeType {
 				],
 			},
 
-			...getToolsAgentProperties({ withStreaming: true }),
+			toolsAgentProperties,
 		],
 		hints: [
 			{
@@ -178,7 +179,10 @@ export class AgentWithLangfuse implements INodeType {
 		],
 	};
 
-	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
-		return await toolsAgentExecute.call(this);
+	async execute(
+		this: IExecuteFunctions,
+		response?: EngineResponse<RequestResponseMetadata>,
+	): Promise<INodeExecutionData[][] | EngineRequest<RequestResponseMetadata>> {
+		return await toolsAgentExecute.call(this, response);
 	}
 }
