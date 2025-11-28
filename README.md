@@ -149,6 +149,7 @@ Here’s how a single request looks inside Langfuse:
 
 ## Version History
 
+- **v0.1.27** – Upgraded langfuse-langchain from v3.0.0 to v3.38.6 for improved trace reliability and bug fixes
 - **v0.1** – Initial release with AI Agent + Langfuse integration
 
 ## License

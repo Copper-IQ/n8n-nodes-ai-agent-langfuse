@@ -29,6 +29,8 @@ import type {
 import assert from 'node:assert';
 
 import { CallbackHandler } from 'langfuse-langchain';
+import { propagateAttributes } from '@langfuse/tracing';
+import Langfuse from 'langfuse';
 
 import { getPromptInputByType } from '../src/utils/helpers';
 import {
@@ -427,36 +429,184 @@ export async function toolsAgentExecute(
 			}
 
 			// ====== Langfuse Integration Start ======
+			this.logger.info('[Langfuse V3] Starting Langfuse integration setup');
 			const langfuseCreds = await this.getCredentials('langfuseCustomApi');
+			this.logger.info('[Langfuse V3] Credentials retrieved', { baseUrl: langfuseCreds.url });
+
 			const rawMetadata = this.getNodeParameter('langfuseMetadata', itemIndex, {}) as any;
+			this.logger.info('[Langfuse V3] Raw metadata from node parameter', { rawMetadata });
+
 			let parsedCustomMetadata: Record<string, unknown> | undefined;
 			if (typeof rawMetadata.customMetadata === 'string') {
 				try {
 					parsedCustomMetadata = JSON.parse(rawMetadata.customMetadata);
+					this.logger.info('[Langfuse V3] Parsed customMetadata from string', { parsedCustomMetadata });
 				} catch (e) {
-					this.logger.warn('Invalid JSON in Langfuse metadata, ignoring customMetadata.');
+					this.logger.warn('[Langfuse V3] Invalid JSON in Langfuse metadata, ignoring customMetadata.', { error: e });
 				}
 			} else {
 				parsedCustomMetadata = rawMetadata.customMetadata;
+				this.logger.info('[Langfuse V3] Using customMetadata as-is (not string)', { parsedCustomMetadata });
 			}
 
+			// Parse tags from node parameter - support both string (comma-separated) and array formats
+			const explicitTags = typeof rawMetadata.tags === 'string'
+				? rawMetadata.tags.split(',').map((t: string) => t.trim()).filter(Boolean)
+				: (Array.isArray(rawMetadata.tags) ? rawMetadata.tags : []);
+
+			// Also allow inheriting context from the connected Chat Model node
+			// The model may already have sessionId/userId/tags set in its metadata
+			const modelMetadata = (model as any)?.metadata ?? {};
+			const modelSessionId = (modelMetadata.sessionId ?? modelMetadata['session.id']) as string | undefined;
+			const modelUserId = (modelMetadata.userId ?? modelMetadata['user.id']) as string | undefined;
+			const modelTagsRaw = (modelMetadata.langfuseTags ?? modelMetadata['langfuse.trace.tags'] ?? modelMetadata.tags) as
+				| string
+				| string[]
+				| undefined;
+			const modelTags = Array.isArray(modelTagsRaw)
+				? modelTagsRaw
+				: typeof modelTagsRaw === 'string'
+					? modelTagsRaw.split(',').map((t: string) => t.trim()).filter(Boolean)
+					: [];
+
+			const tags = explicitTags.length > 0 ? explicitTags : modelTags;
+			this.logger.info('[Langfuse V3] Parsed tags', { explicitTags, modelTags, tags });
+
+			// Node parameters win over model metadata; fall back to model metadata when undefined
 			const langfuseMetadata = {
 				customMetadata: parsedCustomMetadata,
-				sessionId: rawMetadata.sessionId,
-				userId: rawMetadata.userId,
+				sessionId: (rawMetadata.sessionId as string | undefined) ?? modelSessionId,
+				userId: (rawMetadata.userId as string | undefined) ?? modelUserId,
+				tags,
 			};
+			this.logger.info('[Langfuse V3] Resolved Langfuse metadata', { langfuseMetadata, modelMetadata });
 
 			// Extract langfusePrompt from customMetadata if present
 			const langfusePromptMetadata = parsedCustomMetadata?.langfusePrompt as Record<string, unknown> | undefined;
+			this.logger.info('[Langfuse V3] Extracted langfusePrompt metadata', { 
+				hasLangfusePrompt: !!langfusePromptMetadata,
+				langfusePromptMetadata 
+			});
 
-			const langfuseHandler = new CallbackHandler({
+			// CRITICAL: Manually fetch prompt from Langfuse for linking
+			let fetchedPrompt: any = null;
+			if (langfusePromptMetadata) {
+				try {
+					const langfuseClient = new Langfuse({
+						publicKey: langfuseCreds.publicKey as string,
+						secretKey: langfuseCreds.secretKey as string,
+						baseUrl: (langfuseCreds.url as string) ?? process.env.LANGFUSE_HOST,
+					});
+
+					const promptName = langfusePromptMetadata.name as string;
+					const promptVersion = langfusePromptMetadata.version as number | undefined;
+
+					if (promptName) {
+						if (promptVersion) {
+							fetchedPrompt = await langfuseClient.getPrompt(promptName, promptVersion);
+						} else {
+							fetchedPrompt = await langfuseClient.getPrompt(promptName);
+						}
+						this.logger.info('[Langfuse V3] Fetched prompt from Langfuse', {
+							promptName,
+							promptVersion,
+							fetched: !!fetchedPrompt,
+						});
+					}
+				} catch (error) {
+					this.logger.error('[Langfuse V3] Failed to fetch prompt from Langfuse', { error });
+				}
+			}
+
+			// Include fetched prompt in metadata if available
+			const handlerMetadata = {
+				...langfuseMetadata.customMetadata,
+				...(fetchedPrompt ? { prompt: fetchedPrompt } : {}),
+			};
+
+			const baseLangfuseHandler = new CallbackHandler({
 				publicKey: langfuseCreds.publicKey as string,
 				secretKey: langfuseCreds.secretKey as string,
 				baseUrl: (langfuseCreds.url as string) ?? process.env.LANGFUSE_HOST,
 				sessionId: langfuseMetadata.sessionId,
 				userId: langfuseMetadata.userId,
-				metadata: langfuseMetadata.customMetadata,
+				metadata: handlerMetadata,
+				...(fetchedPrompt ? { prompt: fetchedPrompt } : {}),
 			});
+
+			// Wrap handler to log callback invocations
+			const logger = this.logger;  // Capture logger reference
+			const originalHandleChainStart = baseLangfuseHandler.handleChainStart?.bind(baseLangfuseHandler);
+			const originalHandleChainEnd = baseLangfuseHandler.handleChainEnd?.bind(baseLangfuseHandler);
+			const originalHandleLLMStart = baseLangfuseHandler.handleLLMStart?.bind(baseLangfuseHandler);
+			const originalHandleLLMEnd = baseLangfuseHandler.handleLLMEnd?.bind(baseLangfuseHandler);
+			const originalHandleChatModelStart = (baseLangfuseHandler as any).handleChatModelStart?.bind(baseLangfuseHandler);
+			const originalHandleToolStart = baseLangfuseHandler.handleToolStart?.bind(baseLangfuseHandler);
+			const originalHandleToolEnd = baseLangfuseHandler.handleToolEnd?.bind(baseLangfuseHandler);
+
+			if (originalHandleChainStart) {
+				baseLangfuseHandler.handleChainStart = async (...args: any[]) => {
+					logger.info('[Langfuse V3] 🔗 handleChainStart invoked', { chain: args[0]?.name });
+					return (originalHandleChainStart as any)(...args);
+				};
+			}
+			if (originalHandleChainEnd) {
+				baseLangfuseHandler.handleChainEnd = async (...args: any[]) => {
+					logger.info('[Langfuse V3] ✅ handleChainEnd invoked');
+					return (originalHandleChainEnd as any)(...args);
+				};
+			}
+			if (originalHandleLLMStart) {
+				baseLangfuseHandler.handleLLMStart = async (...args: any[]) => {
+					logger.info('[Langfuse V3] 🤖 handleLLMStart invoked', { llm: args[0]?.name });
+					return (originalHandleLLMStart as any)(...args);
+				};
+			}
+			if (originalHandleLLMEnd) {
+				baseLangfuseHandler.handleLLMEnd = async (...args: any[]) => {
+					logger.info('[Langfuse V3] ✅ handleLLMEnd invoked', { tokenUsage: args[0]?.llmOutput?.tokenUsage });
+					return (originalHandleLLMEnd as any)(...args);
+				};
+			}
+			if (originalHandleChatModelStart) {
+				(baseLangfuseHandler as any).handleChatModelStart = async (...args: any[]) => {
+					logger.info('[Langfuse V3] 💬 handleChatModelStart invoked', { 
+						model: args[0]?.name,
+						hasPromptMetadata: !!langfusePromptMetadata,
+						args: args.map((a, i) => ({ index: i, type: typeof a, isObject: typeof a === 'object' }))
+					});
+					// CRITICAL: Inject langfusePrompt into metadata arg for generation-level prompt linking
+					// Signature: handleLLMStart(llm, prompts, runId, parentRunId?, extraParams?, tags?, metadata?, runName?)
+					// metadata is at args[6]
+					if (langfusePromptMetadata) {
+						if (!args[6]) {
+							args[6] = {}; // Create metadata object if it doesn't exist
+						}
+						if (typeof args[6] === 'object') {
+							args[6].langfusePrompt = langfusePromptMetadata;
+							logger.info('[Langfuse V3] Injected langfusePrompt into generation metadata at args[6]', { 
+								langfusePrompt: langfusePromptMetadata 
+							});
+						}
+					}
+					return (originalHandleChatModelStart as any)(...args);
+				};
+			}
+			if (originalHandleToolStart) {
+				baseLangfuseHandler.handleToolStart = async (...args: any[]) => {
+					logger.info('[Langfuse V3] 🔧 handleToolStart invoked', { tool: args[0]?.name });
+					return (originalHandleToolStart as any)(...args);
+				};
+			}
+			if (originalHandleToolEnd) {
+				baseLangfuseHandler.handleToolEnd = async (...args: any[]) => {
+					logger.info('[Langfuse V3] ✅ handleToolEnd invoked');
+					return (originalHandleToolEnd as any)(...args);
+				};
+			}
+
+			const langfuseHandler = baseLangfuseHandler;
+			this.logger.info('[Langfuse V3] CallbackHandler created and wrapped with debug logging');
 			// ====== Langfuse Integration End ======
 
 			// Prepare the prompt messages and prompt template.
@@ -468,7 +618,7 @@ export async function toolsAgentExecute(
 			const prompt: ChatPromptTemplate = preparePrompt(messages);
 
 			// Create executors for primary and fallback models
-			const executor = createAgentSequence(
+			const baseExecutor = createAgentSequence(
 				model,
 				tools,
 				prompt,
@@ -477,6 +627,22 @@ export async function toolsAgentExecute(
 				memory,
 				fallbackModel,
 			);
+
+			// Bind Langfuse handler to the executor using withConfig()
+			// This ensures callbacks propagate to all nested calls
+			// CRITICAL: Use langfuseSessionId, langfuseUserId (camelCase) for Langfuse v3/v4
+			const executor = baseExecutor.withConfig({
+				callbacks: [langfuseHandler],
+				metadata: {
+					langfuseSessionId: langfuseMetadata.sessionId,
+					langfuseUserId: langfuseMetadata.userId,
+					langfuseTags: langfuseMetadata.tags,
+					...langfuseMetadata.customMetadata,
+					// Add prompt metadata if present for prompt linking
+					...(langfusePromptMetadata ? { langfusePrompt: langfusePromptMetadata } : {}),
+				},
+			});
+			this.logger.info('[Langfuse V3] Executor configured with Langfuse handler via withConfig');
 			// Invoke with fallback logic
 			const invokeParams = {
 				steps,
@@ -487,15 +653,8 @@ export async function toolsAgentExecute(
 			};
 			const executeOptions = {
 				signal: this.getExecutionCancelSignal(),
-				callbacks: [langfuseHandler],
-				metadata: {
-					sessionId: langfuseMetadata.sessionId,
-					userId: langfuseMetadata.userId,
-					...langfuseMetadata.customMetadata,
-					// Add prompt metadata if present for prompt linking
-					...(langfusePromptMetadata ? { langfusePrompt: langfusePromptMetadata } : {}),
-				},
 			};
+			this.logger.info('[Langfuse V3] Execute options prepared (callbacks bound via withConfig)');
 
 			// Check if streaming is actually available
 			const isStreamingAvailable = 'isStreaming' in this ? this.isStreaming?.() : undefined;
@@ -511,28 +670,70 @@ export async function toolsAgentExecute(
 					// Load memory variables to respect context window length
 					chatHistory = await loadChatHistory(memory, model, options.maxTokensFromMemory);
 				}
-				const eventStream = executor.streamEvents(
-					{
-						...invokeParams,
-						chat_history: chatHistory,
-					},
-					{
-						version: 'v2',
-						...executeOptions,
-					},
-				);
+				// Wrap in propagateAttributes to set OTEL trace-level attributes for Langfuse session tracking
+				this.logger.info('[Langfuse V3] Wrapping streaming execution with OTEL propagateAttributes', {
+					sessionId: langfuseMetadata.sessionId,
+					userId: langfuseMetadata.userId,
+					tags: langfuseMetadata.tags,
+				});
+			// Convert metadata to Record<string, string> as required by OTEL
+			// Special handling: extract langfusePrompt fields separately for prompt linking
+			const otelMetadata: Record<string, string> = {};
+			if (langfuseMetadata.customMetadata) {
+				for (const [key, value] of Object.entries(langfuseMetadata.customMetadata)) {
+					if (key === 'langfusePrompt') {
+						// Flatten langfusePrompt for OTEL: { name, version, config } -> separate keys
+						const promptObj = value as Record<string, unknown>;
+						if (promptObj.name) otelMetadata['langfuse.prompt.name'] = String(promptObj.name);
+						if (promptObj.version) otelMetadata['langfuse.prompt.version'] = String(promptObj.version);
+						if (promptObj.config) otelMetadata['langfuse.prompt.config'] = JSON.stringify(promptObj.config);
+					} else {
+						otelMetadata[key] = typeof value === 'string' ? value : JSON.stringify(value);
+					}
+				}
+			}
+			const result = await propagateAttributes(
+				{
+					sessionId: langfuseMetadata.sessionId,
+					userId: langfuseMetadata.userId,
+					metadata: Object.keys(otelMetadata).length > 0 ? otelMetadata : undefined,
+					...(langfuseMetadata.tags && langfuseMetadata.tags.length > 0
+						? { tags: langfuseMetadata.tags }
+						: {}),
+				},
+					async () => {
+						const eventStream = executor.streamEvents(
+							{
+								...invokeParams,
+								chat_history: chatHistory,
+							},
+							{
+								version: 'v2',
+								...executeOptions,
+							},
+						);
 
-				const result = await processEventStream(
-					this,
-					eventStream,
-					itemIndex,
-					options.returnIntermediateSteps,
-					memory,
-					input,
+						this.logger.info('[Langfuse V3] Starting streaming execution');
+						return await processEventStream(
+							this,
+							eventStream,
+							itemIndex,
+							options.returnIntermediateSteps,
+							memory,
+							input,
+						);
+					},
 				);
+				this.logger.info('[Langfuse V3] Streaming execution completed');
 
 				// Flush Langfuse handler to ensure traces are sent
-				await langfuseHandler.flushAsync();
+				this.logger.info('[Langfuse V3] Flushing Langfuse handler...');
+				try {
+					await langfuseHandler.flushAsync();
+					this.logger.info('[Langfuse V3] Langfuse handler flushed successfully');
+				} catch (flushError) {
+					this.logger.error('[Langfuse V3] Error flushing Langfuse handler', { error: flushError });
+				}
 
 				// If result contains tool calls, build the request object like the normal flow
 				if (result.toolCalls && result.toolCalls.length > 0) {
@@ -562,16 +763,58 @@ export async function toolsAgentExecute(
 					// Load memory variables to respect context window length
 					chatHistory = await loadChatHistory(memory, model, options.maxTokensFromMemory);
 				}
-				const modelResponse = await executor.invoke(
-					{
-						...invokeParams,
-						chat_history: chatHistory,
+				// Wrap in propagateAttributes to set OTEL trace-level attributes for Langfuse session tracking
+				this.logger.info('[Langfuse V3] Wrapping non-streaming execution with OTEL propagateAttributes', {
+					sessionId: langfuseMetadata.sessionId,
+					userId: langfuseMetadata.userId,
+					tags: langfuseMetadata.tags,
+				});
+			// Convert metadata to Record<string, string> as required by OTEL
+			// Special handling: extract langfusePrompt fields separately for prompt linking
+			const otelMetadata: Record<string, string> = {};
+			if (langfuseMetadata.customMetadata) {
+				for (const [key, value] of Object.entries(langfuseMetadata.customMetadata)) {
+					if (key === 'langfusePrompt') {
+						// Flatten langfusePrompt for OTEL: { name, version, config } -> separate keys
+						const promptObj = value as Record<string, unknown>;
+						if (promptObj.name) otelMetadata['langfuse.prompt.name'] = String(promptObj.name);
+						if (promptObj.version) otelMetadata['langfuse.prompt.version'] = String(promptObj.version);
+						if (promptObj.config) otelMetadata['langfuse.prompt.config'] = JSON.stringify(promptObj.config);
+					} else {
+						otelMetadata[key] = typeof value === 'string' ? value : JSON.stringify(value);
+					}
+				}
+			}
+			const modelResponse = await propagateAttributes(
+				{
+					sessionId: langfuseMetadata.sessionId,
+					userId: langfuseMetadata.userId,
+					metadata: Object.keys(otelMetadata).length > 0 ? otelMetadata : undefined,
+					...(langfuseMetadata.tags && langfuseMetadata.tags.length > 0
+						? { tags: langfuseMetadata.tags }
+						: {}),
+				},
+					async () => {
+						this.logger.info('[Langfuse V3] Starting non-streaming execution');
+						return await executor.invoke(
+							{
+								...invokeParams,
+								chat_history: chatHistory,
+							},
+							executeOptions,
+						);
 					},
-					executeOptions,
 				);
+				this.logger.info('[Langfuse V3] Non-streaming execution completed');
 
 				// Flush Langfuse handler to ensure traces are sent
-				await langfuseHandler.flushAsync();
+				this.logger.info('[Langfuse V3] Flushing Langfuse handler...');
+				try {
+					await langfuseHandler.flushAsync();
+					this.logger.info('[Langfuse V3] Langfuse handler flushed successfully');
+				} catch (flushError) {
+					this.logger.error('[Langfuse V3] Error flushing Langfuse handler', { error: flushError });
+				}
 
 				if ('returnValues' in modelResponse) {
 					// Save conversation to memory including any tool call context
