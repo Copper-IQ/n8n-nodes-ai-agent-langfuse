@@ -446,6 +446,9 @@ export async function toolsAgentExecute(
 				userId: rawMetadata.userId,
 			};
 
+			// Extract langfusePrompt from customMetadata if present
+			const langfusePromptMetadata = parsedCustomMetadata?.langfusePrompt as Record<string, unknown> | undefined;
+
 			const langfuseHandler = new CallbackHandler({
 				publicKey: langfuseCreds.publicKey as string,
 				secretKey: langfuseCreds.secretKey as string,
@@ -489,6 +492,8 @@ export async function toolsAgentExecute(
 					sessionId: langfuseMetadata.sessionId,
 					userId: langfuseMetadata.userId,
 					...langfuseMetadata.customMetadata,
+					// Add prompt metadata if present for prompt linking
+					...(langfusePromptMetadata ? { langfusePrompt: langfusePromptMetadata } : {}),
 				},
 			};
 
@@ -526,6 +531,9 @@ export async function toolsAgentExecute(
 					input,
 				);
 
+				// Flush Langfuse handler to ensure traces are sent
+				await langfuseHandler.flushAsync();
+
 				// If result contains tool calls, build the request object like the normal flow
 				if (result.toolCalls && result.toolCalls.length > 0) {
 					const currentIteration = (response?.metadata?.iterationCount ?? 0) + 1;
@@ -561,6 +569,9 @@ export async function toolsAgentExecute(
 					},
 					executeOptions,
 				);
+
+				// Flush Langfuse handler to ensure traces are sent
+				await langfuseHandler.flushAsync();
 
 				if ('returnValues' in modelResponse) {
 					// Save conversation to memory including any tool call context
